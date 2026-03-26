@@ -38,6 +38,9 @@ interface UserProfile {
     verified: boolean;
     status: 'pending' | 'verified' | 'rejected' | 'none';
     uploadedAt?: any;
+    rejectionReason?: string;
+    extractedData?: any;
+    confidenceScore?: number;
   };
   profileCompletion: number;
   rating?: number;
@@ -92,8 +95,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         // Use onSnapshot for real-time updates
         unsubscribeProfile = onSnapshot(docRef, (docSnap) => {
           if (docSnap.exists()) {
-            log('User profile updated (real-time):', docSnap.data());
-            setUserProfile(docSnap.data() as UserProfile);
+            const data = docSnap.data();
+            console.log('[AuthContext] User profile fetched:', data.uid, 'Role:', data.role);
+            setUserProfile(data as UserProfile);
           } else {
             log('User profile NOT found in Firestore.');
             setUserProfile(null);

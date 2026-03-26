@@ -35,6 +35,7 @@ const ProtectedRoute = ({ children, allowedRoles }: { children: React.ReactNode;
   const { user, userProfile, loading } = useAuth();
 
   if (loading) {
+    console.log('[ProtectedRoute] Loading profile...');
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
         <div className="w-8 h-8 border-4 border-primary border-t-transparent rounded-full animate-spin" />
@@ -47,11 +48,13 @@ const ProtectedRoute = ({ children, allowedRoles }: { children: React.ReactNode;
   }
 
   if (allowedRoles && userProfile && !allowedRoles.includes(userProfile.role)) {
+    console.log(`[ProtectedRoute] Access denied! User role "${userProfile.role}" not in allowedRoles:`, allowedRoles);
     // Redirect to appropriate dashboard based on role
-
     if (userProfile.role === 'developer') return <Navigate to="/developer" replace />;
     if (userProfile.role === 'freelancer') return <Navigate to="/freelancer" replace />;
   }
+
+  console.log(`[ProtectedRoute] Access granted to "${userProfile?.role}" for roles:`, allowedRoles || 'all');
 
   return <>{children}</>;
 };
@@ -70,6 +73,7 @@ const DashboardRedirect = () => {
 
   if (!userProfile) return <Navigate to="/login" replace />;
 
+  console.log('[DashboardRedirect] Redirecting user role:', userProfile.role);
   switch (userProfile.role) {
 
     case 'developer':

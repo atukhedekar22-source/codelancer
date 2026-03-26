@@ -20,15 +20,22 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { Progress } from '@/components/ui/progress';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import Navbar from '@/components/layout/Navbar';
 import Footer from '@/components/layout/Footer';
 import { useAuth } from '@/contexts/AuthContext';
 import { useReviews } from '@/hooks/useReviews';
 import { formatDistanceToNow } from 'date-fns';
 import { doc, updateDoc, serverTimestamp } from 'firebase/firestore';
-import { ref, uploadBytes, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
-import { db, storage } from '@/lib/firebase';
+import { db } from '@/lib/firebase';
 import { useToast } from '@/components/ui/use-toast';
+import { calculateCompletion } from '@/lib/profile';
 
 const Profile = () => {
   const { user, userProfile } = useAuth();
@@ -38,6 +45,7 @@ const Profile = () => {
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [documentType, setDocumentType] = useState('Aadhaar');
 
   // Form State
   const [personalInfo, setPersonalInfo] = useState({
@@ -79,29 +87,56 @@ const Profile = () => {
     }
   }, [userProfile]);
 
-  const calculateCompletion = (data: any) => {
-    let score = 0;
-    const totalWeight = 100;
+  // Check if document was manually deleted from Cloudinary
+  useEffect(() => {
+    const verifyDocumentExists = async () => {
+      if (user?.uid && userProfile?.governmentId?.documentUrl && userProfile.governmentId.verified) {
+        try {
+          // Cloudinary images allow HEAD requests. A 404 means the image is physically deleted from Cloudinary's systems.
+          const res = await fetch(userProfile.governmentId.documentUrl, { method: 'HEAD' });
+          if (res.status === 404 || res.status === 400 || res.status === 403) {
+            console.warn('[Verification] Document was manually deleted from Cloudinary. Revoking status.');
+            
+            // Re-calculate profile completion because they lost verification
+            const updatedProfileData = {
+              ...userProfile,
+              governmentId: {
+                ...userProfile.governmentId,
+                verified: false,
+                status: null,
+                documentUrl: null,
+                extractedData: null,
+                confidenceScore: null,
+              }
+            };
+            const newCompletion = calculateCompletion(updatedProfileData);
 
-    // Personal Info (40%)
-    if (data.fullName) score += 10;
-    if (data.email) score += 10;
-    if (data.phone) score += 10;
-    if (data.address) score += 10;
+            // Delete verification flag from Firebase user doc
+            await updateDoc(doc(db, 'users', user.uid), {
+              'governmentId.verified': false,
+              'governmentId.status': null,
+              'governmentId.documentUrl': null,
+              'governmentId.extractedData': null,
+              'governmentId.confidenceScore': null,
+              profileCompletion: newCompletion
+            });
 
-    // Professional (30%)
-    if (data.skills && data.skills.length > 0) score += 10;
-    if (data.experience) score += 10;
-    if (data.portfolioLinks && data.portfolioLinks.length > 0) score += 10;
+            toast({
+              title: "Verification Revoked",
+              description: "Your verification document was not found or was deleted. Please upload it again.",
+              variant: "destructive"
+            });
+          }
+        } catch (error) {
+          // Ignore structural network failures perfectly so active users aren't unverified offline
+          console.warn('[Verification] Skipped cloud sync check due to network.');
+        }
+      }
+    };
 
-    // Payment (15%)
-    if (data.bankDetails?.bankName && data.bankDetails?.accountNumber) score += 15;
+    verifyDocumentExists();
+  }, [userProfile?.governmentId?.documentUrl, userProfile?.governmentId?.verified, user?.uid, toast]);
 
-    // Verification (15%)
-    if (data.governmentId?.verified) score += 15;
-
-    return Math.min(score, 100);
-  };
 
   const saveProfile = async (sectionData: any, sectionName: string) => {
     if (!user) return;
@@ -187,11 +222,12 @@ const Profile = () => {
     const file = event.target.files?.[0];
     if (!file || !user) return;
 
-    // Validate File Type (PDF)
-    if (file.type !== 'application/pdf') {
+    // Validate File Type (PDF or Image)
+    const allowedTypes = ['application/pdf', 'image/jpeg', 'image/png'];
+    if (!allowedTypes.includes(file.type)) {
       toast({
         title: "Invalid File Type",
-        description: "Please upload a PDF document.",
+        description: "Please upload a PDF or an Image (JPG, PNG).",
         variant: "destructive"
       });
       return;
@@ -211,33 +247,35 @@ const Profile = () => {
     setUploadProgress(0); // Reset progress
 
     try {
-      // Create storage reference
-      const storageRef = ref(storage, `verification_docs/${user.uid}/${Date.now()}_${file.name}`);
+      console.log('[Upload] Starting upload for user:', user.uid);
+      const formData = new FormData();
+      formData.append('document', file);
+      formData.append('documentType', documentType);
+      
+      const response = await fetch('http://localhost:5000/api/verify-document', {
+        method: 'POST',
+        body: formData,
+      });
+      
+      const data = await response.json();
+      
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to verify document via backend.');
+      }
 
-      // Upload file with progress monitoring
-      // Upload file directly (quicker for small files) with timeout
-      console.log("Starting upload for file:", file.name);
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Upload timed out. Check your internet connection or try a smaller file.')), 30000)
-      );
-
-      const snapshot = await Promise.race([
-        uploadBytes(storageRef, file),
-        timeoutPromise
-      ]) as any;
-
-      console.log("Upload successful, fetching download URL...");
-      const downloadURL = await getDownloadURL(snapshot.ref);
-      console.log("Download URL fetched:", downloadURL);
+      console.log('[Upload] Backend response:', data);
 
       const updateData = {
         governmentId: {
-          verified: false,
-          status: 'pending',
-          documentUrl: downloadURL,
+          verified: data.status === 'VERIFIED',
+          status: data.status.toLowerCase(), // 'verified' or 'rejected'
+          documentUrl: data.documentUrl,
           fileName: file.name,
-          type: 'PDF Document',
-          uploadedAt: new Date()
+          type: data.documentType,
+          uploadedAt: new Date(),
+          rejectionReason: data.status === 'REJECTED' ? data.remarks : null,
+          extractedData: data.extractedData || null,
+          confidenceScore: data.confidenceScore || 0
         }
       };
 
@@ -246,16 +284,27 @@ const Profile = () => {
       const fullProfileForCalc = { ...currentProfileData, ...updateData };
       const newCompletion = calculateCompletion(fullProfileForCalc);
 
+      console.log('[Upload] Updating user document in Firestore...');
       await updateDoc(doc(db, 'users', user.uid), {
         ...updateData,
         'governmentId.uploadedAt': serverTimestamp(),
         profileCompletion: newCompletion
       });
+      console.log('[Upload] Firestore document updated successfully!');
 
-      toast({
-        title: "Document Uploaded",
-        description: "Your identity verification request has been submitted."
-      });
+      if (data.status === 'VERIFIED') {
+        toast({
+          title: "Document Verified!",
+          description: "Your document was verified using OCR successfully."
+        });
+      } else {
+        toast({
+          title: "Verification Failed",
+          description: data.remarks || "Your document was reviewed and rejected.",
+          variant: "destructive"
+        });
+      }
+
       setUploading(false);
       // Reset input
       event.target.value = '';
@@ -338,8 +387,8 @@ const Profile = () => {
               <div className="text-right">
                 <p className="text-sm text-muted-foreground mb-2">Profile Completion</p>
                 <div className="flex items-center gap-3">
-                  <Progress value={userProfile?.profileCompletion || 20} className="w-32" />
-                  <span className="font-semibold text-foreground">{userProfile?.profileCompletion || 20}%</span>
+                  <Progress value={calculateCompletion(userProfile || {})} className="w-32" />
+                  <span className="font-semibold text-foreground">{calculateCompletion(userProfile || {})}%</span>
                 </div>
               </div>
             </div>
@@ -493,12 +542,12 @@ const Profile = () => {
               <div className="space-y-6">
                 <h3 className="font-display text-xl font-bold text-foreground">Identity Verification</h3>
 
-                <div className="p-4 rounded-xl bg-muted/50 border border-border">
+                  <div className="p-4 rounded-xl bg-muted/50 border border-border">
                   <div className="flex items-center gap-3 mb-4">
                     {userProfile?.governmentId?.verified ? (
                       <>
                         <CheckCircle className="h-6 w-6 text-success" />
-                        <span className="font-medium text-success">Verified</span>
+                        <span className="font-medium text-success">Verified Automatically ({userProfile?.governmentId?.type})</span>
                       </>
                     ) : userProfile?.governmentId?.status === 'pending' ? (
                       <>
@@ -506,10 +555,17 @@ const Profile = () => {
                         <span className="font-medium text-warning">Pending Verification</span>
                       </>
                     ) : userProfile?.governmentId?.status === 'rejected' ? (
-                      <>
-                        <AlertCircle className="h-6 w-6 text-destructive" />
-                        <span className="font-medium text-destructive">Verification Rejected</span>
-                      </>
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2">
+                          <AlertCircle className="h-6 w-6 text-destructive" />
+                          <span className="font-medium text-destructive">Verification Rejected</span>
+                        </div>
+                        {userProfile.governmentId.rejectionReason && (
+                          <p className="text-sm text-destructive bg-destructive/10 p-3 rounded-md border border-destructive/20 font-medium">
+                            Reason: {userProfile.governmentId.rejectionReason}
+                          </p>
+                        )}
+                      </div>
                     ) : (
                       <>
                         <AlertCircle className="h-6 w-6 text-muted-foreground" />
@@ -517,9 +573,28 @@ const Profile = () => {
                       </>
                     )}
                   </div>
-                  <p className="text-sm text-muted-foreground mb-4">
-                    Upload a government-issued ID (Aadhaar, PAN, Passport) to verify your identity.
-                  </p>
+                  
+                  {!userProfile?.governmentId?.verified && (
+                    <>
+                      <p className="text-sm text-muted-foreground mb-4">
+                        Upload a government-issued ID (Aadhaar, PAN, Driving License) to verify your identity instantly using our automated OCR system.
+                        Accepted formats: PDF, JPG, PNG.
+                      </p>
+
+                      <div className="mb-4 space-y-2">
+                        <Label>Select Document Type</Label>
+                        <select
+                          value={documentType}
+                          onChange={(e) => setDocumentType(e.target.value)}
+                          className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          <option value="Aadhaar">Aadhaar Card</option>
+                          <option value="PAN">PAN Card</option>
+                          <option value="DL">Driving License</option>
+                        </select>
+                      </div>
+                    </>
+                  )}
 
                   {userProfile?.governmentId?.documentUrl && (
                     <div className="mb-4 p-3 bg-secondary/10 rounded-lg flex items-center justify-between">
@@ -527,35 +602,59 @@ const Profile = () => {
                         <Briefcase className="h-4 w-4" />
                         {userProfile.governmentId.fileName || "Uploaded Document"}
                       </span>
-                      <a
-                        href={userProfile.governmentId.documentUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-xs text-primary hover:underline"
-                      >
-                        View
-                      </a>
+                      <Dialog>
+                        <DialogTrigger asChild>
+                          <button className="text-xs text-primary hover:underline bg-transparent border-none cursor-pointer">
+                            View
+                          </button>
+                        </DialogTrigger>
+                        <DialogContent className="max-w-4xl w-[90vw] h-[80vh] p-0 flex flex-col">
+                          <DialogHeader className="p-4 border-b">
+                            <div className="flex items-center justify-between">
+                              <DialogTitle>View Document</DialogTitle>
+                              <a 
+                                href={userProfile.governmentId.documentUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-sm text-primary hover:underline mr-4"
+                              >
+                                Open Original
+                              </a>
+                            </div>
+                          </DialogHeader>
+                          <div className="flex-1 overflow-hidden relative bg-muted/50 flex items-center justify-center p-2">
+                            <img 
+                              key={userProfile.governmentId.documentUrl}
+                              src={userProfile.governmentId.documentUrl?.replace('.pdf', '.jpg')} 
+                              alt="Uploaded Document" 
+                              className="w-full h-full object-contain rounded-md"
+                            />
+                          </div>
+                        </DialogContent>
+                      </Dialog>
                     </div>
                   )}
 
-                  <div className="border-2 border-dashed border-border rounded-xl p-8 text-center">
-                    <Upload className="h-10 w-10 text-muted-foreground mx-auto mb-3" />
-                    <p className="text-muted-foreground mb-4">Drag & drop your ID document here, or click to browse</p>
-                    <Button variant="outline" onClick={triggerFileUpload} disabled={uploading} className="w-full relative overflow-hidden">
-                      {uploading ? (
-                        <span className="relative z-10 flex items-center gap-2">
-                          Uploading...
-                        </span>
-                      ) : "Upload PDF (Max 10MB)"}
-                    </Button>
-                    <input
-                      type="file"
-                      id="verification-upload"
-                      accept=".pdf"
-                      onChange={handleFileChange}
-                      className="hidden"
-                    />
-                  </div>
+                  {!userProfile?.governmentId?.verified && (
+                    <div className="border-2 border-dashed border-border rounded-xl p-8 text-center">
+                      <Upload className="h-10 w-10 text-muted-foreground mx-auto mb-3" />
+                      <p className="text-muted-foreground mb-4">Drag & drop your ID document here, or click to browse</p>
+                      <Button variant="outline" onClick={triggerFileUpload} disabled={uploading} className="w-full relative overflow-hidden">
+                        {uploading ? (
+                          <span className="relative z-10 flex items-center gap-2">
+                            Uploading...
+                          </span>
+                        ) : "Upload Document (Max 10MB)"}
+                      </Button>
+                      <input
+                        type="file"
+                        id="verification-upload"
+                        accept=".pdf, .jpg, .jpeg, .png"
+                        onChange={handleFileChange}
+                        className="hidden"
+                      />
+                    </div>
+                  )}
                 </div>
               </div>
             )}

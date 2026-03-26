@@ -24,6 +24,9 @@ export interface UserProfile {
         fileName?: string;
         type?: string;
         uploadedAt?: any;
+        rejectionReason?: string;
+        extractedData?: any;
+        confidenceScore?: number;
     };
     profileViews?: number;
 }
